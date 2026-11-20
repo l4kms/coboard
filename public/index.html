@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#2563eb" />
+  <title>CoBoard</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+<div id="lobby" class="lobby">
+  <div id="seasonDecor" class="season-decor"></div>
+
+  <div class="lobby-card">
+    <div class="logo-container">
+      <h1 class="logo">CoBoard</h1>
+      <div id="garland" class="garland"></div>
+    </div>
+    
+    <div class="tabs">
+      <button id="tabCreate" class="tab active">Создать</button>
+      <button id="tabJoin" class="tab">Войти</button>
+    </div>
+
+    <div id="paneCreate" class="pane">
+      <label>ID комнаты (пусто = случайный)</label>
+      <input id="createRoomId" maxlength="40" placeholder="studio" />
+      <label>Пароль</label>
+      <input id="createPassword" type="password" maxlength="64" placeholder="••••" />
+      <label>Максимум участников (2–4)</label>
+      <input id="createMaxUsers" type="number" min="2" max="4" value="2" />
+      <button id="btnCreate" class="primary">Создать комнату</button>
+      <div id="createError" class="error"></div>
+    </div>
+
+    <div id="paneJoin" class="pane hidden">
+      <label>ID комнаты</label>
+      <input id="joinRoomId" maxlength="40" placeholder="studio" />
+      <label>Пароль</label>
+      <input id="joinPassword" type="password" maxlength="64" placeholder="••••" />
+      <button id="btnJoin" class="primary">Войти</button>
+      <div id="joinError" class="error"></div>
+    </div>
+  </div>
+</div>
+
+<div id="editor" class="editor hidden">
+  <header class="toolbar">
+    <!-- Инструменты -->
+    <div class="group">
+      <button id="btnPen"        class="tool active"><span class="icon">✏️</span><span class="label">Кисть</span></button>
+      <button id="btnEraser"     class="tool"><span class="icon">🧽</span><span class="label">Ластик</span></button>
+      <button id="btnEraserLine" class="tool"><span class="icon">✂️</span><span class="label">Стереть</span></button>
+      <button id="btnFill"       class="tool"><span class="icon">🪣</span><span class="label">Заливка</span></button>
+      <button id="btnPicker"     class="tool"><span class="icon">🎯</span><span class="label">Пипетка</span></button>
+      <button id="btnLine"       class="tool"><span class="icon">╱</span><span class="label">Линия</span></button>
+      <button id="btnRect"       class="tool"><span class="icon">▭</span><span class="label">Прямоуг.</span></button>
+      <button id="btnEllipse"    class="tool"><span class="icon">◯</span><span class="label">Эллипс</span></button>
+      <button id="btnText"       class="tool"><span class="icon">T</span><span class="label">Текст</span></button>
+      <button id="btnSelect"     class="tool"><span class="icon">⬚</span><span class="label">Выделить</span></button>
+      <button id="btnPaste"      class="tool"><span class="icon">📋</span><span class="label">Вставить</span></button>
+    </div>
+    
+    <!-- Настройки -->
+    <div class="group">
+      <input id="colorInput" type="color" value="#000000" title="Цвет" />
+      <input id="sizeInput" type="range" min="1" max="64" value="4" title="Размер" />
+      <input id="opacityInput" type="range" min="5" max="100" value="100" title="Прозрачность" />
+    </div>
+
+    <!-- Действия -->
+    <div class="group">
+      <button id="btnUndo"      class="tool"><span class="icon">↶</span><span class="label">Отменить</span></button>
+      <button id="btnRedo"      class="tool"><span class="icon">↷</span><span class="label">Повторить</span></button>
+      <button id="btnGrid"      class="tool"><span class="icon">#</span><span class="label">Сетка</span></button>
+      <button id="btnZoomOut"   class="tool"><span class="icon">−</span><span class="label">Уменьшить</span></button>
+      <button id="btnZoomReset" class="tool"><span class="icon">1:1</span><span class="label">Сброс</span></button>
+      <button id="btnZoomIn"    class="tool"><span class="icon">+</span><span class="label">Увеличить</span></button>
+      <button id="btnMove"      class="tool"><span class="icon">✋</span><span class="label">Пан</span></button>
+      <button id="btnClear"     class="tool"><span class="icon">🗑️</span><span class="label">Очистить</span></button>
+      <button id="btnDownload"  class="tool"><span class="icon">⬇️</span><span class="label">Скачать</span></button>
+      <button id="btnLeave"     class="tool danger"><span class="icon">🚪</span><span class="label">Выйти</span></button>
+      <button id="btnHelp"      class="tool"><span class="icon">?</span><span class="label">Справка</span></button>
+    </div>
+  </header>
+
+  <main class="stage">
+    <canvas id="board"   width="1920" height="1080"></canvas>
+    <canvas id="overlay" width="1920" height="1080"></canvas>
+  </main>
+
+  <div class="statusbar">
+    <span id="statusRoom">—</span>
+    <span id="statusUsers">—</span>
+    <span id="statusCoords">—</span>
+  </div>
+</div>
+
+<div id="contextMenu" class="context-menu hidden">
+  <div class="ctx-item" id="ctxCut">Вырезать</div>
+  <div class="ctx-item" id="ctxPaste">Вставить</div>
+  <div class="ctx-item" id="ctxDelete">Удалить</div>
+</div>
+
+<div id="helpModal" class="modal hidden">
+  <div class="modal-card">
+    <h2>Справка CoBoard</h2>
+    <ul>
+      <li><b>B</b> кисть, <b>E</b> обычный ластик, <b>X</b> стирание линии</li>
+      <li><b>F</b> заливка, <b>P</b> пипетка</li>
+      <li><b>L</b> линия, <b>R</b> прямоугольник, <b>O</b> эллипс, <b>T</b> текст, <b>S</b> выделение</li>
+      <li><b>Ctrl+Z</b> отменить, <b>Ctrl+Y</b> / <b>Ctrl+Shift+Z</b> повторить</li>
+      <li><b>Ctrl+V</b> вставить картинку из буфера</li>
+      <li><b>ПКМ</b> / <b>долгий тап</b> внутри выделения: вырезать / вставить / удалить</li>
+      <li><b>Пробел</b> + drag = pan; колесо = zoom</li>
+      <li><b>G</b> сетка, <b>Ctrl+0</b> сбросить zoom</li>
+    </ul>
+    <button id="helpClose" class="primary">Понятно</button>
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
