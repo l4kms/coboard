@@ -7,12 +7,11 @@ const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 
 // === 1. Подключение к Supabase ===
-// Эти переменные нужно будет добавить в Environment на Render
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseSecret = process.env.SUPABASE_SECRET;
 
 if (!supabaseUrl || !supabaseSecret) {
-    console.error('ОШИБКА: Не заданы переменные окружения SUPABASE_URL и SUPABASE_SECRET');
+    console.error('ОШИБКА: Не заданы SUPABASE_URL и SUPABASE_SECRET');
     process.exit(1);
 }
 
@@ -24,7 +23,7 @@ const MAX_ROOM_BYTES = 50 * 1024 * 1024;
 const MAX_USERS_PER_ROOM = 4;
 const MAX_ROOMS = 500;
 
-// ====== Загрузка комнат из Supabase при старте ======
+// ====== Загрузка комнат из Supabase ======
 const rooms = new Map();
 
 async function loadRoomsFromDB() {
@@ -50,7 +49,7 @@ async function loadRoomsFromDB() {
 }
 loadRoomsFromDB();
 
-// ====== Сохранение комнаты в Supabase (асинхронно, без блокировки) ======
+// ====== Сохранение комнаты в Supabase ======
 async function saveRoomToDB(roomId) {
     const room = rooms.get(roomId);
     if (!room) return;
@@ -74,7 +73,7 @@ async function saveRoomToDB(roomId) {
 // ====== Очистка старых комнат ======
 setInterval(async () => {
     const now = Date.now();
-    const ROOM_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 дней
+    const ROOM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
     let removedIds = [];
     
     for (const [id, room] of rooms) {
@@ -94,7 +93,7 @@ setInterval(async () => {
     }
 }, 60 * 60 * 1000);
 
-// === Express и Socket.IO (без изменений) ===
+// === Express и Socket.IO ===
 const app = express();
 app.disable('x-powered-by');
 
@@ -131,7 +130,7 @@ const io = new Server(server, {
     maxHttpBufferSize: 5e6,
     pingInterval: 20000,
     pingTimeout: 25000,
-    cors: { origin: "*" } // Разрешаем подключения с любого домена (для Render)
+    cors: { origin: "*" }
 });
 
 // ====== Валидация ======
@@ -237,8 +236,7 @@ io.on('connection', (socket) => {
                 seq: 0, bytes: 0, lastActivity: Date.now()
             });
             
-            // Сохраняем в БД асинхронно
-            saveRoomToDB(roomId);
+            saveRoomToDB(roomId); // сохраняем сразу
             
             ack({ ok: true, roomId });
         } catch (e) {
@@ -308,9 +306,8 @@ io.on('connection', (socket) => {
         socket.to(socket.roomId).emit('draw', safe);
         if (typeof ack === 'function') ack({ ok: true, seq: safe.seq });
         
-        // Сохраняем в БД (с задержкой, чтобы не спамить запросами)
-        clearTimeout(room._saveTimer);
-        room._saveTimer = setTimeout(() => saveRoomToDB(socket.roomId), 2000);
+        // Сохраняем в БД БЕЗ ЗАДЕРЖКИ, чтобы ластик точно сработал при перезагрузке
+        saveRoomToDB(socket.roomId);
     });
 
     socket.on('cursor', (pos) => {
@@ -336,6 +333,10 @@ io.on('connection', (socket) => {
         const room = rooms.get(socket.roomId);
         if (room) room.users.delete(socket.id);
         socket.to(socket.roomId).emit('userLeft', { authorId: socket.authorId });
+        
+        // Сохраняем перед выходом
+        saveRoomToDB(socket.roomId);
+        
         socket.leave(socket.roomId);
         socket.roomId = null;
         socket.authorId = null;
