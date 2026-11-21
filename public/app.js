@@ -110,8 +110,9 @@ let lastPoint = null;
 let shapeStart = null;
 let activePointerId = null;
 let spaceDown = false;
+let textInputActive = false; // <--- ВОЗВРАЩЕНО
 
-let strokePoints = []; // Перенесено сюда во избежание ошибки TDZ
+let strokePoints = [];
 let selection = null;
 let clipCanvas = null;
 let localEvents = [];
