@@ -26,7 +26,67 @@ document.addEventListener('gesturechange', (e) => e.preventDefault());
 document.addEventListener('gestureend', (e) => e.preventDefault());
 
 // ============================================================
-// 2. Состояние
+// 2. Сезонное оформление (Снег, листья, гирлянда)
+// ============================================================
+function initSeasonDecor() {
+  const month = new Date().getMonth();
+  const container = $('seasonDecor');
+  const garland = $('garland');
+  if (!container) return;
+
+  const isWinter = (month === 11 || month <= 1);
+  const isAutumn = (month >= 8 && month <= 10);
+
+  if (isWinter) {
+    for (let i = 0; i < 50; i++) {
+      const flake = document.createElement('div');
+      flake.className = 'particle snow'; flake.textContent = '❄';
+      flake.style.left = Math.random() * 100 + 'vw';
+      flake.style.fontSize = (Math.random() * 10 + 10) + 'px';
+      flake.style.animationDuration = (Math.random() * 4 + 4) + 's';
+      flake.style.animationDelay = (Math.random() * 5) + 's';
+      container.appendChild(flake);
+    }
+    if (garland) {
+      const icons = ['🎄', '🎁', '❄', '🔔'];
+      for (let i = 0; i < 8; i++) {
+        const span = document.createElement('span');
+        span.textContent = icons[i % icons.length];
+        span.style.animationDelay = (i * 0.2) + 's';
+        garland.appendChild(span);
+      }
+    }
+  } else if (isAutumn) {
+    for (let i = 0; i < 30; i++) {
+      const leaf = document.createElement('div');
+      leaf.className = 'particle leaf'; leaf.textContent = '🍂';
+      leaf.style.left = Math.random() * 100 + 'vw';
+      leaf.style.fontSize = (Math.random() * 15 + 15) + 'px';
+      leaf.style.animationDuration = (Math.random() * 5 + 5) + 's';
+      leaf.style.animationDelay = (Math.random() * 5) + 's';
+      container.appendChild(leaf);
+    }
+  } else if (month >= 2 && month <= 4) {
+    for (let i = 0; i < 20; i++) {
+      const petal = document.createElement('div');
+      petal.className = 'particle leaf'; petal.textContent = '🌸';
+      petal.style.left = Math.random() * 100 + 'vw';
+      petal.style.fontSize = (Math.random() * 12 + 12) + 'px';
+      petal.style.animationDuration = (Math.random() * 6 + 6) + 's';
+      petal.style.animationDelay = (Math.random() * 5) + 's';
+      container.appendChild(petal);
+    }
+  } else {
+    const sun = document.createElement('div');
+    sun.textContent = '☀️';
+    sun.style.cssText = 'position:absolute; top:30px; right:40px; font-size:48px; animation: float 4s infinite;';
+    container.appendChild(sun);
+  }
+}
+initSeasonDecor();
+
+// ============================================================
+// 3. Состояние
 // ============================================================
 let socket = null;
 let roomId = null;
@@ -49,12 +109,12 @@ let panStart = null;
 let lastPoint = null;
 let shapeStart = null;
 let activePointerId = null;
+let spaceDown = false;
 
+let strokePoints = []; // Перенесено сюда во избежание ошибки TDZ
 let selection = null;
 let clipCanvas = null;
-
-// Для ластика
-let localEvents = []; // локальная копия всех событий (для умного ластика)
+let localEvents = [];
 
 // Синхронизация
 let lastSeq = 0;
@@ -77,7 +137,7 @@ let historyIndex = -1;
 let pendingBBox = null;
 
 // ============================================================
-// 3. Overlay и статус
+// 4. Overlay и статус
 // ============================================================
 const remoteCursors = new Map();
 let cursorsDirty = false;
@@ -153,7 +213,7 @@ function updateStatus() {
 }
 
 // ============================================================
-// 4. История (Undo/Redo)
+// 5. История (Undo/Redo)
 // ============================================================
 function bboxExpand(x, y, pad = 0) {
   const x1 = x - pad, y1 = y - pad, x2 = x + pad, y2 = y + pad;
@@ -199,7 +259,7 @@ function redo() {
 }
 
 // ============================================================
-// 5. Viewport
+// 6. Viewport
 // ============================================================
 function applyViewport() {
   const t = `translate(${panX}px, ${panY}px) scale(${zoom})`;
@@ -236,7 +296,7 @@ function setActiveTool(t) {
 }
 
 // ============================================================
-// 6. Заливка
+// 7. Заливка
 // ============================================================
 function hexToRgba(hex) {
   let h = hex.replace('#', '');
@@ -267,7 +327,7 @@ function floodFillAsync(x, y, colorHex, op) {
 }
 
 // ============================================================
-// 7. Применение событий
+// 8. Применение событий
 // ============================================================
 function decodeImage(src) {
   if (imageCache.has(src)) return imageCache.get(src);
@@ -336,7 +396,7 @@ function handleIncoming(ev) {
 }
 
 // ============================================================
-// 8. Сеть
+// 9. Сеть
 // ============================================================
 function connect() {
   if (socket) return;
@@ -370,22 +430,21 @@ function sendDraw(ev) {
 }
 
 // ============================================================
-// 9. Инструменты
+// 10. Инструменты
 // ============================================================
 function startStroke(pt) {
   beginHistory(); bboxExpand(pt.x, pt.y, size + 2);
   isDrawing = true; lastPoint = pt;
-  let pts = [[pt.x, pt.y]];
+  strokePoints = [[pt.x, pt.y]];
+  
   ctx.save();
   if (tool === 'eraser') { ctx.globalCompositeOperation = 'destination-out'; ctx.strokeStyle = '#000'; ctx.fillStyle = '#000'; ctx.globalAlpha = 1; }
   else { ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = opacity; ctx.strokeStyle = color; ctx.fillStyle = color; }
   ctx.lineWidth = size; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
   ctx.beginPath(); ctx.arc(pt.x, pt.y, size / 2, 0, Math.PI * 2); ctx.fill();
   ctx.restore();
-  return pts;
 }
 
-let strokePoints = [];
 function continueStroke(pt) {
   ctx.save();
   if (tool === 'eraser') { ctx.globalCompositeOperation = 'destination-out'; ctx.strokeStyle = '#000'; ctx.globalAlpha = 1; }
@@ -402,7 +461,7 @@ function finishStroke() {
   commitHistory();
   const ev = { type: 'stroke', points: simplifyPoints(strokePoints), color: tool === 'eraser' ? '#000' : color, size, erase: tool === 'eraser', opacity: tool === 'eraser' ? 1 : opacity };
   sendDraw(ev);
-  localEvents.push(ev); // Сохраняем для умного ластика
+  localEvents.push(ev);
   strokePoints = [];
 }
 
@@ -470,7 +529,6 @@ function eraseLineAt(pt) {
     if (isHit) {
       localEvents.splice(i, 1);
       redrawAll();
-      // Отправляем clearArea, чтобы сервер сохранил это
       const bbox = getEventBBox(ev);
       beginHistory(); bboxExpand(bbox.x, bbox.y, 2); bboxExpand(bbox.x + bbox.w, bbox.y + bbox.h, 2); commitHistory();
       sendDraw({ type: 'clearArea', x: bbox.x, y: bbox.y, w: bbox.w, h: bbox.h });
@@ -503,7 +561,7 @@ function redrawAll() {
 }
 
 // ============================================================
-// 10. Выделение (упрощенно для brevity)
+// 11. Выделение
 // ============================================================
 let draggingSelection = false, dragBaseImage = null, dragClipOffset = null, dragCurrentRect = null, dragOldRect = null;
 function startDragSelection(pt) {
@@ -570,7 +628,7 @@ document.addEventListener('paste', async (e) => {
 });
 
 // ============================================================
-// 11. Ввод
+// 12. Ввод
 // ============================================================
 board.addEventListener('pointerdown', (e) => {
   if (activePointerId !== null && activePointerId !== e.pointerId) return; activePointerId = e.pointerId;
@@ -582,7 +640,7 @@ board.addEventListener('pointerdown', (e) => {
   else if (selection && !pointInRect(pt.x, pt.y, selection)) { selection = null; selectionDirty = true; scheduleOverlay(); }
   
   switch (tool) {
-    case 'pen': case 'eraser': strokePoints = startStroke(pt); break;
+    case 'pen': case 'eraser': startStroke(pt); break;
     case 'eraser-line': eraseLineAt(pt); break;
     case 'fill': pushFillHistory(pt); break;
     case 'picker': pickColor(pt); break;
@@ -624,10 +682,23 @@ window.addEventListener('pointerup', (e) => {
   }
 });
 
+window.addEventListener('pointercancel', (e) => {
+  if (e.pointerId !== activePointerId) return; activePointerId = null;
+  if (isPanning) { isPanning = false; panStart = null; board.classList.remove('panning'); }
+  if (draggingSelection) { finishDragSelection(); return; }
+  if (isDrawing) {
+    if (tool === 'pen' || tool === 'eraser') finishStroke();
+    else if (tool === 'line' || tool === 'rect' || tool === 'ellipse') finishShape();
+  }
+});
+
+board.addEventListener('wheel', (e) => {
+  e.preventDefault(); zoomAt(e.deltaY < 0 ? 1.1 : 1 / 1.1, e.clientX, e.clientY);
+}, { passive: false });
+
 // ============================================================
-// 12. Кнопки и клавиатура
+// 13. Кнопки и клавиатура
 // ============================================================
-let spaceDown = false;
 $('btnPen').addEventListener('click', () => setActiveTool('pen'));
 $('btnEraser').addEventListener('click', () => setActiveTool('eraser'));
 $('btnEraserLine').addEventListener('click', () => setActiveTool('eraser-line'));
@@ -699,7 +770,7 @@ $('ctxPaste').addEventListener('click', () => { pasteClipboard(); contextMenu.cl
 $('ctxDelete').addEventListener('click', () => { deleteSelection(); contextMenu.classList.add('hidden'); });
 
 // ============================================================
-// 13. Лобби
+// 14. Лобби
 // ============================================================
 $('tabCreate').addEventListener('click', () => { $('tabCreate').classList.add('active'); $('tabJoin').classList.remove('active'); $('paneCreate').classList.remove('hidden'); $('paneJoin').classList.add('hidden'); });
 $('tabJoin').addEventListener('click', () => { $('tabJoin').classList.add('active'); $('tabCreate').classList.remove('active'); $('paneJoin').classList.remove('hidden'); $('paneCreate').classList.add('hidden'); });
@@ -753,18 +824,5 @@ async function enterRoom(rId, aId, mUsers, events) {
   applyViewport(); updateStatus(); gridDirty = true; selectionDirty = true; scheduleOverlay();
   setActiveTool('pen');
 }
-
-// Сезонное оформление
-function initSeasonDecor() {
-  const month = new Date().getMonth(); const container = $('seasonDecor'); if (!container) return;
-  if (month === 11 || month <= 1) {
-    for (let i = 0; i < 50; i++) {
-      const flake = document.createElement('div'); flake.className = 'particle snow'; flake.textContent = '❄';
-      flake.style.left = Math.random() * 100 + 'vw'; flake.style.fontSize = (Math.random() * 10 + 10) + 'px';
-      flake.style.animationDuration = (Math.random() * 4 + 4) + 's'; flake.style.animationDelay = (Math.random() * 5) + 's'; container.appendChild(flake);
-    }
-  }
-}
-initSeasonDecor();
 
 })();
