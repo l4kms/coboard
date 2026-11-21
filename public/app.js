@@ -26,17 +26,15 @@ document.addEventListener('gesturechange', (e) => e.preventDefault());
 document.addEventListener('gestureend', (e) => e.preventDefault());
 
 // ============================================================
-// 2. Сезонное оформление (Снег, листья, гирлянда)
+// 2. Сезонное оформление
 // ============================================================
 function initSeasonDecor() {
   const month = new Date().getMonth();
   const container = $('seasonDecor');
   const garland = $('garland');
   if (!container) return;
-
   const isWinter = (month === 11 || month <= 1);
   const isAutumn = (month >= 8 && month <= 10);
-
   if (isWinter) {
     for (let i = 0; i < 50; i++) {
       const flake = document.createElement('div');
@@ -110,26 +108,16 @@ let lastPoint = null;
 let shapeStart = null;
 let activePointerId = null;
 let spaceDown = false;
-let textInputActive = false; // <--- ВОЗВРАЩЕНО
+let textInputActive = false;
 
 let strokePoints = [];
 let selection = null;
 let clipCanvas = null;
-let localEvents = [];
 
 // Синхронизация
 let lastSeq = 0;
-const pendingEvents = new Map();
+let pendingImageSync = null;
 const imageCache = new Map();
-let applyQueue = Promise.resolve();
-
-// Заливка
-const fillWorker = new Worker('/fill-worker.js');
-const fillResolvers = [];
-fillWorker.onmessage = (e) => {
-  const r = fillResolvers.shift();
-  if (r) r(e.data);
-};
 
 // История (Undo/Redo)
 const MAX_HISTORY = 60;
@@ -162,11 +150,7 @@ function renderOverlay(ts) {
   octx.clearRect(0, 0, overlay.width, overlay.height);
   if (gridDirty) drawGrid();
   if (selection) drawSelectionRect();
-  if (needCursor) {
-    drawRemoteCursors(now);
-    lastCursorDraw = now;
-    cursorsDirty = false;
-  }
+  if (needCursor) { drawRemoteCursors(now); lastCursorDraw = now; cursorsDirty = false; }
   selectionDirty = false;
 }
 function drawGrid() {
@@ -214,7 +198,7 @@ function updateStatus() {
 }
 
 // ============================================================
-// 5. История (Undo/Redo)
+// 5. История
 // ============================================================
 function bboxExpand(x, y, pad = 0) {
   const x1 = x - pad, y1 = y - pad, x2 = x + pad, y2 = y + pad;
@@ -311,7 +295,10 @@ function floodFillAsync(x, y, colorHex, op) {
     catch (e) { resolve(null); return; }
     const [fr, fg, fb] = hexToRgba(colorHex);
     const fa = Math.round(255 * (op != null ? op : opacity));
-    fillResolvers.push((res) => {
+    const worker = new Worker('/fill-worker.js');
+    worker.onmessage = (e) => {
+      const res = e.data;
+      worker.terminate();
       if (!res || !res.bbox) { resolve(null); return; }
       const { x: bx, y: by, w, h } = res.bbox;
       const u8 = new Uint8ClampedArray(res.buffer);
@@ -322,8 +309,8 @@ function floodFillAsync(x, y, colorHex, op) {
       }
       ctx.putImageData(region, bx, by);
       resolve(res.bbox);
-    });
-    fillWorker.postMessage({ data: img.data, W: board.width, H: board.height, x: Math.floor(x), y: Math.floor(y), fill: [fr, fg, fb, fa], tol: 16 }, [img.data.buffer]);
+    };
+    worker.postMessage({ data: img.data, W: board.width, H: board.height, x: Math.floor(x), y: Math.floor(y), fill: [fr, fg, fb, fa], tol: 16 }, [img.data.buffer]);
   });
 }
 
@@ -386,48 +373,69 @@ async function applyEventSerialized(ev) {
   applyEventSync(ev);
 }
 
-function enqueueApply(ev) { applyQueue = applyQueue.then(() => applyEventSerialized(ev)).catch(() => {}); }
-function drainPending() { while (pendingEvents.has(lastSeq + 1)) { const ev = pendingEvents.get(lastSeq + 1); pendingEvents.delete(lastSeq + 1); enqueueApply(ev); lastSeq++; } }
-
-function handleIncoming(ev) {
-  if (!ev || typeof ev.seq !== 'number') return;
-  if (ev.seq > lastSeq) lastSeq = ev.seq;
-  if (ev.authorId && ev.authorId === authorId) { drainPending(); return; }
-  enqueueApply(ev); drainPending();
-}
-
 // ============================================================
 // 9. Сеть
 // ============================================================
 function connect() {
   if (socket) return;
   socket = io({ transports: ['websocket', 'polling'] });
-  socket.on('draw', handleIncoming);
-  socket.on('cursor', (data) => { if (!data || typeof data.authorId !== 'string') return; remoteCursors.set(data.authorId, { x: data.x, y: data.y, t: performance.now() }); cursorsDirty = true; scheduleOverlay(); });
+  
+  socket.on('draw', async (ev) => {
+    if (!ev || typeof ev.seq !== 'number') return;
+    if (ev.seq > lastSeq) lastSeq = ev.seq;
+    if (ev.authorId === authorId) return;
+    await applyEventSerialized(ev);
+  });
+
+  socket.on('cursor', (data) => {
+    if (!data || typeof data.authorId !== 'string') return;
+    remoteCursors.set(data.authorId, { x: data.x, y: data.y, t: performance.now() });
+    cursorsDirty = true; scheduleOverlay();
+  });
+  
   socket.on('userJoined', () => updateStatus());
   socket.on('userLeft', (data) => { if (data && data.authorId) remoteCursors.delete(data.authorId); cursorsDirty = true; scheduleOverlay(); updateStatus(); });
-  socket.on('fullSync', async (data) => {
-    if (!data || !Array.isArray(data.events)) return;
-    board.style.pointerEvents = 'none';
-    try {
-      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, board.width, board.height);
-      lastSeq = 0; pendingEvents.clear(); applyQueue = Promise.resolve();
-      localEvents = [];
-      for (const ev of data.events) {
-        if (typeof ev.seq !== 'number') continue;
-        if (ev.authorId === authorId) { lastSeq = Math.max(lastSeq, ev.seq); continue; }
-        await applyEventSerialized(ev); lastSeq = Math.max(lastSeq, ev.seq);
-        if (['stroke','line','rect','ellipse'].includes(ev.type)) localEvents.push(ev);
-      }
-      history.length = 0; historyIndex = -1;
-    } finally { board.style.pointerEvents = ''; }
+  
+  // НОВОЕ: приём картинки
+  socket.on('imageSynced', (dataUrl) => {
+    const img = new Image();
+    img.onload = () => {
+      ctx.clearRect(0, 0, board.width, board.height);
+      ctx.drawImage(img, 0, 0);
+    };
+    img.src = dataUrl;
   });
+
+  socket.on('fullSync', async (data) => {
+    if (!data) return;
+    if (data.image) {
+      const img = new Image();
+      await new Promise(res => { img.onload = res; img.onerror = res; img.src = data.image; });
+      ctx.clearRect(0, 0, board.width, board.height);
+      ctx.drawImage(img, 0, 0);
+    } else {
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, board.width, board.height);
+    }
+    lastSeq = data.seq || 0;
+  });
+
   socket.on('disconnect', () => { remoteCursors.clear(); updateStatus(); });
 }
 
 function sendDraw(ev) {
   if (!socket || !roomId) return;
-  socket.emit('draw', ev, (res) => { if (res && typeof res.seq === 'number') { if (res.seq > lastSeq) lastSeq = res.seq; drainPending(); } });
+  socket.emit('draw', ev);
+}
+
+// === НОВОЕ: сохраняем картинку на сервер ===
+let saveImageTimer = null;
+function saveSnapshot() {
+  if (!socket || !roomId) return;
+  if (saveImageTimer) clearTimeout(saveImageTimer);
+  saveImageTimer = setTimeout(() => {
+    const dataUrl = board.toDataURL('image/jpeg', 0.7);
+    socket.emit('syncImage', dataUrl);
+  }, 500); // debounce 500ms
 }
 
 // ============================================================
@@ -437,7 +445,6 @@ function startStroke(pt) {
   beginHistory(); bboxExpand(pt.x, pt.y, size + 2);
   isDrawing = true; lastPoint = pt;
   strokePoints = [[pt.x, pt.y]];
-  
   ctx.save();
   if (tool === 'eraser') { ctx.globalCompositeOperation = 'destination-out'; ctx.strokeStyle = '#000'; ctx.fillStyle = '#000'; ctx.globalAlpha = 1; }
   else { ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = opacity; ctx.strokeStyle = color; ctx.fillStyle = color; }
@@ -445,7 +452,6 @@ function startStroke(pt) {
   ctx.beginPath(); ctx.arc(pt.x, pt.y, size / 2, 0, Math.PI * 2); ctx.fill();
   ctx.restore();
 }
-
 function continueStroke(pt) {
   ctx.save();
   if (tool === 'eraser') { ctx.globalCompositeOperation = 'destination-out'; ctx.strokeStyle = '#000'; ctx.globalAlpha = 1; }
@@ -455,15 +461,14 @@ function continueStroke(pt) {
   ctx.restore();
   strokePoints.push([pt.x, pt.y]); bboxExpand(pt.x, pt.y, size + 2); lastPoint = pt;
 }
-
 function finishStroke() {
   isDrawing = false;
   if (strokePoints.length === 0) return;
   commitHistory();
   const ev = { type: 'stroke', points: simplifyPoints(strokePoints), color: tool === 'eraser' ? '#000' : color, size, erase: tool === 'eraser', opacity: tool === 'eraser' ? 1 : opacity };
   sendDraw(ev);
-  localEvents.push(ev);
   strokePoints = [];
+  saveSnapshot(); // <--- СОХРАНЯЕМ
 }
 
 function previewShape(pt) {
@@ -471,7 +476,6 @@ function previewShape(pt) {
   drawShapeOnCtx(octx, { type: tool, x1: shapeStart.x, y1: shapeStart.y, x2: pt.x, y2: pt.y, size, color, filled: false });
   lastPoint = pt;
 }
-
 function finishShape() {
   isDrawing = false;
   octx.clearRect(0, 0, overlay.width, overlay.height);
@@ -480,8 +484,8 @@ function finishShape() {
   beginHistory(); bboxExpand(shapeStart.x, shapeStart.y, size + 2); bboxExpand(lastPoint.x, lastPoint.y, size + 2);
   const ev = { type: tool, x1: shapeStart.x, y1: shapeStart.y, x2: lastPoint.x, y2: lastPoint.y, size, color, filled: false };
   drawShapeOnCtx(ctx, ev); commitHistory(); sendDraw(ev);
-  localEvents.push(ev);
   shapeStart = null;
+  saveSnapshot(); // <--- СОХРАНЯЕМ
 }
 
 async function pushFillHistory(pt) {
@@ -493,72 +497,32 @@ async function pushFillHistory(pt) {
     const tmp = document.createElement('canvas'); tmp.width = bbox.w; tmp.height = bbox.h;
     tmp.getContext('2d').putImageData(region, 0, 0);
     sendDraw({ type: 'fill', x: bbox.x, y: bbox.y, w: bbox.w, h: bbox.h, src: tmp.toDataURL('image/png'), color, opacity });
+    saveSnapshot();
   }
 }
 
 function pickColor(pt) {
   try { const d = ctx.getImageData(Math.floor(pt.x), Math.floor(pt.y), 1, 1).data; color = '#' + [d[0], d[1], d[2]].map(v => v.toString(16).padStart(2, '0')).join(''); colorInput.value = color; } catch (e) {}
 }
-
 function startTextInput(pt) {
   if (isDrawing) return;
   isDrawing = true; const text = prompt('Введите текст:'); if (!text) { isDrawing = false; return; }
   beginHistory(); bboxExpand(pt.x, pt.y, 400);
   const ev = { type: 'text', x: pt.x, y: pt.y, size: Math.max(12, size * 4), color, text };
   applyEventSync(ev); commitHistory(); sendDraw(ev); isDrawing = false;
+  saveSnapshot();
 }
 
 // === УМНЫЙ ЛАСТИК ===
 function eraseLineAt(pt) {
   const x = pt.x, y = pt.y;
   const tolerance = Math.max(20, size * 3);
-  let erased = false;
-  for (let i = localEvents.length - 1; i >= 0; i--) {
-    const ev = localEvents[i];
-    let isHit = false;
-    if (ev.type === 'stroke' && ev.points) {
-      for (const p of ev.points) { if (Math.hypot(p[0] - x, p[1] - y) < tolerance) { isHit = true; break; } }
-    } else if (ev.type === 'line') {
-      if (distToSegment({x, y}, {x: ev.x1, y: ev.y1}, {x: ev.x2, y: ev.y2}) < tolerance) isHit = true;
-    } else if (ev.type === 'rect') {
-      const rx = Math.min(ev.x1, ev.x2), ry = Math.min(ev.y1, ev.y2); const rw = Math.abs(ev.x2 - ev.x1), rh = Math.abs(ev.y2 - ev.y1);
-      if (x >= rx - tolerance && x <= rx + rw + tolerance && y >= ry - tolerance && y <= ry + rh + tolerance) isHit = true;
-    } else if (ev.type === 'ellipse') {
-      const cx = (ev.x1 + ev.x2) / 2, cy = (ev.y1 + ev.y2) / 2; const rx = Math.abs(ev.x2 - ev.x1) / 2, ry = Math.abs(ev.y2 - ev.y1) / 2;
-      if (((x - cx) ** 2) / ((rx + tolerance) ** 2) + ((y - cy) ** 2) / ((ry + tolerance) ** 2) <= 1) isHit = true;
-    }
-    if (isHit) {
-      localEvents.splice(i, 1);
-      redrawAll();
-      const bbox = getEventBBox(ev);
-      beginHistory(); bboxExpand(bbox.x, bbox.y, 2); bboxExpand(bbox.x + bbox.w, bbox.y + bbox.h, 2); commitHistory();
-      sendDraw({ type: 'clearArea', x: bbox.x, y: bbox.y, w: bbox.w, h: bbox.h });
-      erased = true; break;
-    }
-  }
-}
-
-function distToSegment(p, v, w) {
-  const l2 = (w.x - v.x) ** 2 + (w.y - v.y) ** 2; if (l2 === 0) return Math.hypot(p.x - v.x, p.y - v.y);
-  let t = ((p.x - v.x) * (w.x - v.x) + (p.y - v.y) * (w.y - v.y)) / l2; t = Math.max(0, Math.min(1, t));
-  const proj = { x: v.x + t * (w.x - v.x), y: v.y + t * (w.y - v.y) }; return Math.hypot(p.x - proj.x, p.y - proj.y);
-}
-
-function getEventBBox(ev) {
-  if (ev.type === 'stroke' && ev.points) {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const p of ev.points) { minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]); minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]); }
-    const pad = ev.size || 4; return { x: minX - pad, y: minY - pad, w: maxX - minX + pad * 2, h: maxY - minY + pad * 2 };
-  } else if (ev.type === 'line' || ev.type === 'rect' || ev.type === 'ellipse') {
-    const minX = Math.min(ev.x1, ev.x2), minY = Math.min(ev.y1, ev.y2); const pad = ev.size || 4;
-    return { x: minX - pad, y: minY - pad, w: Math.abs(ev.x2 - ev.x1) + pad * 2, h: Math.abs(ev.y2 - ev.y1) + pad * 2 };
-  }
-  return { x: 0, y: 0, w: 0, h: 0 };
-}
-
-function redrawAll() {
-  ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, board.width, board.height);
-  for (const ev of localEvents) applyEventSync(ev);
+  // Удаляем все, что попало
+  beginHistory(); bboxExpand(x - tolerance, y - tolerance, 0); bboxExpand(x + tolerance, y + tolerance, 0);
+  ctx.clearRect(x - tolerance, y - tolerance, tolerance * 2, tolerance * 2);
+  commitHistory();
+  sendDraw({ type: 'clearArea', x: x - tolerance, y: y - tolerance, w: tolerance * 2, h: tolerance * 2 });
+  saveSnapshot();
 }
 
 // ============================================================
@@ -589,6 +553,7 @@ function finishDragSelection() {
   selection = { x: newR.x, y: newR.y, w: newR.w, h: newR.h }; selectionDirty = true; scheduleOverlay();
   sendDraw({ type: 'moveSelection', fromX: oldR.x, fromY: oldR.y, x: newR.x, y: newR.y, w: newR.w, h: newR.h, src: clipCanvas.toDataURL('image/png') });
   dragBaseImage = null; dragCurrentRect = null; dragOldRect = null;
+  saveSnapshot();
 }
 function cutSelection() {
   if (!selection) return; const w = Math.floor(selection.w), h = Math.floor(selection.h); if (w < 1 || h < 1) return;
@@ -596,11 +561,13 @@ function cutSelection() {
   clip.getContext('2d').drawImage(board, selection.x, selection.y, w, h, 0, 0, w, h); clipCanvas = clip;
   beginHistory(); bboxExpand(selection.x, selection.y, 2); bboxExpand(selection.x + w, selection.y + h, 2); ctx.clearRect(selection.x, selection.y, w, h); commitHistory();
   sendDraw({ type: 'cutSelection', x: selection.x, y: selection.y, w, h, src: clip.toDataURL('image/png') });
+  saveSnapshot();
 }
 function deleteSelection() {
   if (!selection) return; const w = Math.floor(selection.w), h = Math.floor(selection.h); if (w < 1 || h < 1) return;
   beginHistory(); bboxExpand(selection.x, selection.y, 2); bboxExpand(selection.x + w, selection.y + h, 2); ctx.clearRect(selection.x, selection.y, w, h); commitHistory();
   sendDraw({ type: 'deleteSelection', x: selection.x, y: selection.y, w, h });
+  saveSnapshot();
 }
 function pasteClipboard() {
   if (!clipCanvas) return; const w = clipCanvas.width, h = clipCanvas.height;
@@ -608,6 +575,7 @@ function pasteClipboard() {
   beginHistory(); bboxExpand(cx, cy, 2); bboxExpand(cx + w, cy + h, 2); ctx.drawImage(clipCanvas, cx, cy); commitHistory();
   selection = { x: cx, y: cy, w, h }; selectionDirty = true; scheduleOverlay();
   sendDraw({ type: 'pasteImage', x: cx, y: cy, w, h, src: clipCanvas.toDataURL('image/png') });
+  saveSnapshot();
 }
 document.addEventListener('paste', async (e) => {
   if (!roomId) return; const items = e.clipboardData && e.clipboardData.items; if (!items) return;
@@ -622,6 +590,7 @@ document.addEventListener('paste', async (e) => {
         beginHistory(); bboxExpand(cx, cy, 2); bboxExpand(cx + w, cy + h, 2); ctx.drawImage(clip, cx, cy); commitHistory();
         selection = { x: cx, y: cy, w, h }; selectionDirty = true; scheduleOverlay();
         sendDraw({ type: 'pasteImage', x: cx, y: cy, w, h, src: clip.toDataURL('image/jpeg', 0.85) });
+        saveSnapshot();
       } catch (err) {} finally { URL.revokeObjectURL(url); }
       return;
     }
@@ -639,7 +608,6 @@ board.addEventListener('pointerdown', (e) => {
   const pt = getBoardPoint(e);
   if (selection && pointInRect(pt.x, pt.y, selection)) { startDragSelection(pt); return; }
   else if (selection && !pointInRect(pt.x, pt.y, selection)) { selection = null; selectionDirty = true; scheduleOverlay(); }
-  
   switch (tool) {
     case 'pen': case 'eraser': startStroke(pt); break;
     case 'eraser-line': eraseLineAt(pt); break;
@@ -650,7 +618,6 @@ board.addEventListener('pointerdown', (e) => {
     case 'select': selection = { x: pt.x, y: pt.y, w: 0, h: 0 }; selectionDirty = true; scheduleOverlay(); isDrawing = true; break;
   }
 });
-
 window.addEventListener('pointermove', (e) => {
   if (e.pointerId !== activePointerId) return;
   const pt = getBoardPoint(e);
@@ -668,7 +635,6 @@ window.addEventListener('pointermove', (e) => {
     selectionDirty = true; scheduleOverlay();
   }
 });
-
 window.addEventListener('pointerup', (e) => {
   if (e.pointerId !== activePointerId) return; activePointerId = null;
   if (isPanning) { isPanning = false; panStart = null; board.classList.remove('panning'); return; }
@@ -682,7 +648,6 @@ window.addEventListener('pointerup', (e) => {
     selectionDirty = true; scheduleOverlay(); isDrawing = false;
   }
 });
-
 window.addEventListener('pointercancel', (e) => {
   if (e.pointerId !== activePointerId) return; activePointerId = null;
   if (isPanning) { isPanning = false; panStart = null; board.classList.remove('panning'); }
@@ -692,10 +657,7 @@ window.addEventListener('pointercancel', (e) => {
     else if (tool === 'line' || tool === 'rect' || tool === 'ellipse') finishShape();
   }
 });
-
-board.addEventListener('wheel', (e) => {
-  e.preventDefault(); zoomAt(e.deltaY < 0 ? 1.1 : 1 / 1.1, e.clientX, e.clientY);
-}, { passive: false });
+board.addEventListener('wheel', (e) => { e.preventDefault(); zoomAt(e.deltaY < 0 ? 1.1 : 1 / 1.1, e.clientX, e.clientY); }, { passive: false });
 
 // ============================================================
 // 13. Кнопки и клавиатура
@@ -721,7 +683,7 @@ $('btnZoomReset').addEventListener('click', () => { zoom = 1; panX = 0; panY = 0
 $('btnClear').addEventListener('click', () => {
   if (!confirm('Очистить всю доску?')) return;
   beginHistory(); bboxExpand(0, 0, 0); bboxExpand(board.width, board.height, 0); ctx.clearRect(0, 0, board.width, board.height); commitHistory(); sendDraw({ type: 'clear' });
-  localEvents.length = 0;
+  saveSnapshot();
 });
 $('btnDownload').addEventListener('click', () => { const link = document.createElement('a'); link.download = `coboard-${roomId || 'canvas'}.png`; link.href = board.toDataURL('image/png'); link.click(); });
 $('btnLeave').addEventListener('click', () => { if (socket && roomId) socket.emit('leaveRoom'); setTimeout(() => location.reload(), 100); });
@@ -756,7 +718,6 @@ document.addEventListener('keydown', (e) => {
 });
 document.addEventListener('keyup', (e) => { if (e.key === ' ') { spaceDown = false; board.classList.remove('pan'); } });
 
-// Контекстное меню
 const contextMenu = $('contextMenu');
 board.addEventListener('contextmenu', (e) => {
   if (!selection) return;
@@ -792,35 +753,29 @@ $('btnJoin').addEventListener('click', () => {
   if (!payload.roomId) { $('joinError').textContent = 'Введите ID комнаты'; return; }
   socket.emit('joinRoom', payload, (res) => {
     if (!res || !res.ok) { $('joinError').textContent = (res && res.error) || 'Ошибка'; return; }
-    enterRoom(res.roomId, res.authorId, res.maxUsers, res.events || []);
+    enterRoom(res.roomId, res.authorId, res.maxUsers, res.events || [], res.image);
   });
 });
 
-async function enterRoom(rId, aId, mUsers, events) {
+async function enterRoom(rId, aId, mUsers, events, imageData) {
   roomId = rId; authorId = aId; maxUsers = mUsers;
   isDrawing = false; isPanning = false; panStart = null; draggingSelection = false;
   dragBaseImage = null; dragCurrentRect = null; dragOldRect = null;
   selection = null; clipCanvas = null; strokePoints = []; shapeStart = null; lastPoint = null; textInputActive = false;
-  localEvents = [];
 
   lobbyEl.classList.add('hidden'); editorEl.classList.remove('hidden');
-  ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, board.width, board.height);
+  
+  // Загружаем сохранённую картинку (если есть)
+  if (imageData) {
+    const img = new Image();
+    await new Promise(res => { img.onload = res; img.onerror = res; img.src = imageData; });
+    ctx.drawImage(img, 0, 0);
+  } else {
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, board.width, board.height);
+  }
 
   history.length = 0; historyIndex = -1; pendingBBox = null;
-  lastSeq = 0; pendingEvents.clear(); applyQueue = Promise.resolve(); imageCache.clear();
-
-  board.style.pointerEvents = 'none';
-  try {
-    for (const ev of events) {
-      if (typeof ev.seq !== 'number') continue;
-      if (ev.authorId === authorId) { lastSeq = Math.max(lastSeq, ev.seq); continue; }
-      await applyEventSerialized(ev); lastSeq = Math.max(lastSeq, ev.seq);
-      if (['stroke','line','rect','ellipse'].includes(ev.type)) localEvents.push(ev);
-    }
-  } catch (e) {} finally {
-    board.style.pointerEvents = '';
-    isDrawing = false;
-  }
+  lastSeq = 0;
 
   applyViewport(); updateStatus(); gridDirty = true; selectionDirty = true; scheduleOverlay();
   setActiveTool('pen');

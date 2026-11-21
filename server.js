@@ -6,358 +6,155 @@ const express = require('express');
 const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 
-// === 1. Подключение к Supabase ===
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseSecret = process.env.SUPABASE_SECRET;
-
-if (!supabaseUrl || !supabaseSecret) {
-    console.error('ОШИБКА: Не заданы SUPABASE_URL и SUPABASE_SECRET');
-    process.exit(1);
-}
-
+if (!supabaseUrl || !supabaseSecret) { console.error('Нет ключей Supabase'); process.exit(1); }
 const supabase = createClient(supabaseUrl, supabaseSecret);
 
 const PORT = process.env.PORT || 3000;
-const MAX_EVENTS_PER_ROOM = 20000;
-const MAX_ROOM_BYTES = 50 * 1024 * 1024;
 const MAX_USERS_PER_ROOM = 4;
 const MAX_ROOMS = 500;
 
-// ====== Загрузка комнат из Supabase ======
 const rooms = new Map();
 
 async function loadRoomsFromDB() {
     try {
         const { data, error } = await supabase.from('coboard_rooms').select('*');
         if (error) throw error;
-        
         for (const row of data) {
             rooms.set(row.id, {
                 password: row.password || '',
                 maxUsers: row.max_users || 2,
-                events: row.events || [],
+                events: row.events || [], // Оставляем для совместимости
+                image: row.image || null, // <--- НОВОЕ ПОЛЕ
                 users: new Set(),
                 seq: row.seq || 0,
                 bytes: row.bytes || 0,
                 lastActivity: row.last_activity || Date.now()
             });
         }
-        console.log(`Загружено ${rooms.size} комнат из Supabase`);
-    } catch (e) {
-        console.error('Ошибка загрузки комнат из Supabase:', e.message);
-    }
+        console.log(`Загружено ${rooms.size} комнат`);
+    } catch (e) { console.error('Ошибка загрузки:', e.message); }
 }
 loadRoomsFromDB();
 
-// ====== Сохранение комнаты в Supabase ======
 async function saveRoomToDB(roomId) {
     const room = rooms.get(roomId);
     if (!room) return;
-    
     try {
         const { error } = await supabase.from('coboard_rooms').upsert({
             id: roomId,
             password: room.password,
             max_users: room.maxUsers,
             events: room.events,
+            image: room.image, // <--- СОХРАНЯЕМ КАРТИНКУ
             seq: room.seq,
             bytes: room.bytes,
             last_activity: room.lastActivity
         });
-        if (error) console.error('Ошибка сохранения комнаты:', error.message);
-    } catch (e) {
-        console.error('Ошибка записи в Supabase:', e.message);
-    }
+        if (error) console.error('Ошибка сохранения:', error.message);
+    } catch (e) { console.error('Ошибка записи:', e.message); }
 }
 
-// ====== Очистка старых комнат ======
-setInterval(async () => {
-    const now = Date.now();
-    const ROOM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-    let removedIds = [];
-    
-    for (const [id, room] of rooms) {
-        if (room.users.size === 0 && now - room.lastActivity > ROOM_TTL_MS) {
-            rooms.delete(id);
-            removedIds.push(id);
-        }
-    }
-    
-    if (removedIds.length > 0) {
-        try {
-            await supabase.from('coboard_rooms').delete().in('id', removedIds);
-            console.log(`Удалено ${removedIds.length} старых комнат`);
-        } catch (e) {
-            console.error('Ошибка удаления старых комнат:', e.message);
-        }
-    }
-}, 60 * 60 * 1000);
-
-// === Express и Socket.IO ===
+// === Express ===
 const app = express();
 app.disable('x-powered-by');
-
 app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-    res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader(
-        'Content-Security-Policy',
-        [
-            "default-src 'self'",
-            "script-src 'self'",
-            "style-src 'self' 'unsafe-inline'",
-            "img-src 'self' data: blob:",
-            "connect-src 'self' ws: wss: data:",
-            "font-src 'self'",
-            "worker-src 'self' blob:",
-            "object-src 'none'",
-            "base-uri 'self'",
-            "frame-ancestors 'self'"
-        ].join('; ')
-    );
+    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss: data:; font-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'");
     next();
 });
-
-app.use(express.static(path.join(__dirname, 'public'), {
-    setHeaders: (res, p) => {
-        if (/\.(js|css|html)$/.test(p)) res.setHeader('Cache-Control', 'no-cache');
-    }
-}));
+app.use(express.static(path.join(__dirname, 'public')));
 
 const server = http.createServer(app);
-const io = new Server(server, {
-    maxHttpBufferSize: 5e6,
-    pingInterval: 20000,
-    pingTimeout: 25000,
-    cors: { origin: "*" }
-});
+const io = new Server(server, { maxHttpBufferSize: 5e6, cors: { origin: "*" } });
 
-// ====== Валидация ======
 const ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 const PW_RE = /^[\x20-\x7E]{0,64}$/;
 const isNum = (n) => typeof n === 'number' && Number.isFinite(n);
-const clampN = (n, a, b) => Math.max(a, Math.min(b, n));
 
 function validateEvent(ev) {
     if (!ev || typeof ev !== 'object') return false;
-    const t = ev.type;
-    if (typeof t !== 'string') return false;
-
-    switch (t) {
-        case 'stroke': {
-            if (!Array.isArray(ev.points) || ev.points.length === 0 || ev.points.length > 8000) return false;
-            for (const p of ev.points) {
-                if (!Array.isArray(p) || p.length !== 2) return false;
-                if (!isNum(p[0]) || !isNum(p[1])) return false;
-                if (Math.abs(p[0]) > 1e6 || Math.abs(p[1]) > 1e6) return false;
-            }
-            if (!isNum(ev.size) || ev.size < 1 || ev.size > 200) return false;
-            if (typeof ev.color !== 'string' || ev.color.length > 32) return false;
-            if (typeof ev.erase !== 'boolean') return false;
-            if (!isNum(ev.opacity) || ev.opacity < 0 || ev.opacity > 1) return false;
-            return true;
-        }
-        case 'fill': {
-            if (!isNum(ev.x) || !isNum(ev.y)) return false;
-            if (!isNum(ev.w) || ev.w <= 0 || ev.w > 4000) return false;
-            if (!isNum(ev.h) || ev.h <= 0 || ev.h > 4000) return false;
-            if (typeof ev.color !== 'string' || ev.color.length > 32) return false;
-            if (!isNum(ev.opacity) || ev.opacity < 0 || ev.opacity > 1) return false;
-            if (typeof ev.src !== 'string' || ev.src.length > 4_800_000) return false;
-            if (!ev.src.startsWith('data:image/')) return false;
-            return true;
-        }
-        case 'line': case 'rect': case 'ellipse': {
-            if (!isNum(ev.x1) || !isNum(ev.y1) || !isNum(ev.x2) || !isNum(ev.y2)) return false;
-            if (!isNum(ev.size) || ev.size < 1 || ev.size > 200) return false;
-            if (typeof ev.color !== 'string' || ev.color.length > 32) return false;
-            if (typeof ev.filled !== 'boolean') return false;
-            return true;
-        }
-        case 'text': {
-            if (!isNum(ev.x) || !isNum(ev.y)) return false;
-            if (!isNum(ev.size) || ev.size < 6 || ev.size > 400) return false;
-            if (typeof ev.color !== 'string' || ev.color.length > 32) return false;
-            if (typeof ev.text !== 'string' || ev.text.length === 0 || ev.text.length > 2000) return false;
-            return true;
-        }
-        case 'pasteImage': case 'moveSelection': case 'cutSelection': {
-            if (!isNum(ev.x) || !isNum(ev.y)) return false;
-            if (!isNum(ev.w) || ev.w <= 0 || ev.w > 4000) return false;
-            if (!isNum(ev.h) || ev.h <= 0 || ev.h > 4000) return false;
-            if (typeof ev.src !== 'string' || ev.src.length > 4_800_000) return false;
-            if (!ev.src.startsWith('data:image/')) return false;
-            if (t === 'moveSelection' && (!isNum(ev.fromX) || !isNum(ev.fromY))) return false;
-            return true;
-        }
-        case 'deleteSelection': case 'clearArea': {
-            if (!isNum(ev.x) || !isNum(ev.y)) return false;
-            if (!isNum(ev.w) || ev.w <= 0 || ev.w > 4000) return false;
-            if (!isNum(ev.h) || ev.h <= 0 || ev.h > 4000) return false;
-            return true;
-        }
-        case 'clear': return true;
-        default: return false;
-    }
+    if (typeof ev.type !== 'string') return false;
+    // Разрешаем все нужные типы
+    if (!['stroke','fill','line','rect','ellipse','text','pasteImage','moveSelection','cutSelection','deleteSelection','clearArea','clear'].includes(ev.type)) return false;
+    return true;
 }
 
-function makeRoomId() {
-    let id;
-    do { id = Math.random().toString(36).slice(2, 8); } while (rooms.has(id));
-    return id;
-}
+function makeRoomId() { let id; do { id = Math.random().toString(36).slice(2, 8); } while (rooms.has(id)); return id; }
 
-// ====== Socket.IO ======
 io.on('connection', (socket) => {
-    socket.roomId = null;
-    socket.authorId = null;
+    socket.roomId = null; socket.authorId = null;
 
     socket.on('createRoom', (payload, ack) => {
         try {
-            if (typeof ack !== 'function') return;
-            if (rooms.size >= MAX_ROOMS) return ack({ ok: false, error: 'Сервер перегружен' });
-
             const rawId = payload && payload.roomId;
-            const rawPw = payload && payload.password;
-            const rawMax = payload && payload.maxUsers;
-
             let roomId = rawId == null || rawId === '' ? makeRoomId() : String(rawId);
-            if (!ID_RE.test(roomId)) return ack({ ok: false, error: 'Неверный ID комнаты' });
-            if (rooms.has(roomId)) return ack({ ok: false, error: 'Комната уже существует' });
-
-            const password = rawPw == null ? '' : String(rawPw);
+            if (!ID_RE.test(roomId)) return ack({ ok: false, error: 'Неверный ID' });
+            if (rooms.has(roomId)) return ack({ ok: false, error: 'Уже есть' });
+            const password = payload && payload.password ? String(payload.password) : '';
             if (!PW_RE.test(password)) return ack({ ok: false, error: 'Неверный пароль' });
-
-            const maxUsers = Math.max(2, Math.min(MAX_USERS_PER_ROOM, Number(rawMax) || 2));
-
-            rooms.set(roomId, {
-                password, maxUsers, events: [], users: new Set(),
-                seq: 0, bytes: 0, lastActivity: Date.now()
-            });
+            const maxUsers = Math.max(2, Math.min(MAX_USERS_PER_ROOM, Number(payload.maxUsers) || 2));
             
-            saveRoomToDB(roomId); // сохраняем сразу
-            
+            rooms.set(roomId, { password, maxUsers, events: [], image: null, users: new Set(), seq: 0, bytes: 0, lastActivity: Date.now() });
+            saveRoomToDB(roomId);
             ack({ ok: true, roomId });
-        } catch (e) {
-            if (typeof ack === 'function') ack({ ok: false, error: 'Внутренняя ошибка' });
-        }
+        } catch (e) { ack({ ok: false, error: 'Ошибка' }); }
     });
 
     socket.on('joinRoom', (payload, ack) => {
         try {
-            if (typeof ack !== 'function') return;
-            const roomId = String((payload && payload.roomId) || '');
-            const password = String((payload && payload.password) || '');
-            if (!ID_RE.test(roomId)) return ack({ ok: false, error: 'Неверный ID комнаты' });
-
+            const roomId = String(payload.roomId || '');
+            const password = String(payload.password || '');
             const room = rooms.get(roomId);
-            if (!room) return ack({ ok: false, error: 'Комната не найдена' });
+            if (!room) return ack({ ok: false, error: 'Не найдена' });
             if (room.password !== password) return ack({ ok: false, error: 'Неверный пароль' });
-            if (room.users.size >= room.maxUsers) return ack({ ok: false, error: 'Комната заполнена' });
+            if (room.users.size >= room.maxUsers) return ack({ ok: false, error: 'Заполнена' });
 
             const authorId = 'u' + Math.random().toString(36).slice(2, 10);
+            socket.join(roomId); socket.roomId = roomId; socket.authorId = authorId;
+            room.users.add(socket.id); room.lastActivity = Date.now();
 
-            socket.join(roomId);
-            socket.roomId = roomId;
-            socket.authorId = authorId;
-            room.users.add(socket.id);
-            room.lastActivity = Date.now();
-
-            ack({
-                ok: true, roomId, authorId,
-                maxUsers: room.maxUsers,
-                events: room.events,
-                seq: room.seq
-            });
-
+            ack({ ok: true, roomId, authorId, maxUsers: room.maxUsers, events: room.events, image: room.image, seq: room.seq });
             socket.to(roomId).emit('userJoined', { authorId });
-        } catch (e) {
-            if (typeof ack === 'function') ack({ ok: false, error: 'Внутренняя ошибка' });
-        }
+        } catch (e) { ack({ ok: false, error: 'Ошибка' }); }
     });
 
     socket.on('draw', (ev, ack) => {
-        if (!socket.roomId || !socket.authorId) {
-            if (typeof ack === 'function') ack({ ok: false });
-            return;
-        }
+        if (!socket.roomId || !socket.authorId) { if (ack) ack({ ok: false }); return; }
         const room = rooms.get(socket.roomId);
-        if (!room) {
-            if (typeof ack === 'function') ack({ ok: false });
-            return;
-        }
-        if (!validateEvent(ev)) {
-            if (typeof ack === 'function') ack({ ok: false });
-            return;
-        }
+        if (!room || !validateEvent(ev)) { if (ack) ack({ ok: false }); return; }
+
+        // Если это событие 'clear' — сбрасываем картинку
+        if (ev.type === 'clear') room.image = null;
+        // Если это картинка (рисование) — мы просто сохраняем её как новую версию
+        if (ev.image) room.image = ev.image;
 
         const safe = { ...ev, authorId: socket.authorId, seq: ++room.seq };
-        const size = JSON.stringify(safe).length;
         room.events.push(safe);
-        room.bytes += size;
         room.lastActivity = Date.now();
-
-        while ((room.events.length > MAX_EVENTS_PER_ROOM || room.bytes > MAX_ROOM_BYTES) && room.events.length > 0) {
-            const removed = room.events.shift();
-            room.bytes -= JSON.stringify(removed).length;
-        }
 
         socket.to(socket.roomId).emit('draw', safe);
-        if (typeof ack === 'function') ack({ ok: true, seq: safe.seq });
-        
-        // Сохраняем в БД БЕЗ ЗАДЕРЖКИ, чтобы ластик точно сработал при перезагрузке
+        if (ack) ack({ ok: true, seq: safe.seq });
         saveRoomToDB(socket.roomId);
     });
 
-    socket.on('cursor', (pos) => {
-        if (!socket.roomId || !socket.authorId) return;
-        if (!pos || !isNum(pos.x) || !isNum(pos.y)) return;
-        socket.to(socket.roomId).emit('cursor', {
-            authorId: socket.authorId,
-            x: clampN(pos.x, -1e6, 1e6),
-            y: clampN(pos.y, -1e6, 1e6),
-            zoom: isNum(pos.zoom) ? clampN(pos.zoom, 0.1, 8) : 1
-        });
-    });
-
-    socket.on('requestSync', () => {
+    // === НОВОЕ СОБЫТИЕ: синхронизация изображения ===
+    socket.on('syncImage', (imageDataUrl) => {
         if (!socket.roomId) return;
         const room = rooms.get(socket.roomId);
         if (!room) return;
-        socket.emit('fullSync', { events: room.events, seq: room.seq });
+        room.image = imageDataUrl;
+        saveRoomToDB(socket.roomId);
+        // Рассылаем другим (они просто обновят холст)
+        socket.to(socket.roomId).emit('imageSynced', imageDataUrl);
     });
 
-    socket.on('leaveRoom', () => {
-        if (!socket.roomId) return;
-        const room = rooms.get(socket.roomId);
-        if (room) room.users.delete(socket.id);
-        socket.to(socket.roomId).emit('userLeft', { authorId: socket.authorId });
-        
-        // Сохраняем перед выходом
-        saveRoomToDB(socket.roomId);
-        
-        socket.leave(socket.roomId);
-        socket.roomId = null;
-        socket.authorId = null;
-    });
-
-    socket.on('disconnect', () => {
-        if (!socket.roomId) return;
-        const room = rooms.get(socket.roomId);
-        if (!room) return;
-        room.users.delete(socket.id);
-        socket.to(socket.roomId).emit('userLeft', { authorId: socket.authorId });
-        room.lastActivity = Date.now();
-        saveRoomToDB(socket.roomId);
-    });
+    socket.on('cursor', (pos) => { if (socket.roomId && pos && isNum(pos.x)) socket.to(socket.roomId).emit('cursor', { authorId: socket.authorId, x: pos.x, y: pos.y }); });
+    socket.on('requestSync', () => { if (socket.roomId) { const room = rooms.get(socket.roomId); if (room) socket.emit('fullSync', { events: room.events, image: room.image, seq: room.seq }); } });
+    socket.on('leaveRoom', () => { if (socket.roomId) { const room = rooms.get(socket.roomId); if (room) room.users.delete(socket.id); socket.to(socket.roomId).emit('userLeft', { authorId: socket.authorId }); socket.leave(socket.roomId); socket.roomId = null; } });
+    socket.on('disconnect', () => { if (socket.roomId) { const room = rooms.get(socket.roomId); if (room) room.users.delete(socket.id); socket.to(socket.roomId).emit('userLeft', { authorId: socket.authorId }); saveRoomToDB(socket.roomId); } });
 });
 
-// Пинг для поддержания активности Supabase (раз в сутки)
-setInterval(async () => {
-    await supabase.from('coboard_keepalive').select('id').limit(1);
-}, 24 * 60 * 60 * 1000);
-
-server.listen(PORT, () => {
-    console.log(`CoBoard running on http://localhost:${PORT}`);
-});
+server.listen(PORT, () => console.log(`CoBoard on ${PORT}`));
